@@ -1,9 +1,15 @@
 <?php
 use Aws\Common\Aws;
+use Aws\Common\Exception\AwsExceptionInterface;
+use Aws\Iam\Exception\IamException;
+use Aws\Common\Exception\InstanceProfileCredentialsException;
+use Doctrine\Common\Cache\FilesystemCache;
+use Guzzle\Cache\DoctrineCacheAdapter;
 
 class Amazon_Web_Services extends AWS_Plugin_Base {
 
 	private $plugin_title, $plugin_menu_title, $plugin_permission, $client;
+	private $errors;
 
 	const SETTINGS_KEY = 'aws_settings';
 
@@ -29,7 +35,19 @@ class Amazon_Web_Services extends AWS_Plugin_Base {
 		$this->plugin_title      = __( 'Amazon Web Services', 'amazon-web-services' );
 		$this->plugin_menu_title = __( 'AWS', 'amazon-web-services' );
 
+		if ( ! is_wp_error($this->errors) ) {
+			$this->errors = new WP_Error();
+		}
+
 		load_plugin_textdomain( 'amazon-web-services', false, dirname( plugin_basename( $plugin_file_path ) ) . '/languages/' );
+	}
+
+	function get_error_message($code) {
+		return $this->errors->get_error_message($code);
+	}
+
+	function get_error_data($code) {
+		return $this->errors->get_error_data($code);
 	}
 
 	/**
@@ -123,33 +141,87 @@ class Amazon_Web_Services extends AWS_Plugin_Base {
 	 * Process the saving of the settings form
 	 */
 	function handle_post_request() {
-		if ( empty( $_POST['action'] ) || 'save' != sanitize_key( $_POST['action'] ) ) { // input var okay
+		if ( empty( $_POST['action'] )
+				|| ( 'save' != sanitize_key( $_POST['action'] )
+					&& 'test_credentials' != sanitize_key( $_POST['action'] ) ) ) { // input var okay
 			return;
 		}
 
-		if ( empty( $_POST['_wpnonce'] ) || ! wp_verify_nonce( sanitize_key( $_POST['_wpnonce'] ), 'aws-save-settings' ) ) { // input var okay
+		if ( empty( $_POST['_wpnonce'] )
+				|| ( ! wp_verify_nonce( sanitize_key( $_POST['_wpnonce'] ), 'aws-save-settings' )
+					&& ! wp_verify_nonce( sanitize_key( $_POST['_wpnonce'] ), 'aws-test-settings' ) ) ) { // input var okay
 			die( __( "Cheatin' eh?", 'amazon-web-services' ) );
 		}
 
 		// Make sure $this->settings has been loaded
 		$this->get_settings();
 
-		$post_vars = array( 'access_key_id', 'secret_access_key' );
-		foreach ( $post_vars as $var ) {
-			if ( ! isset( $_POST[ $var ] ) ) { // input var okay
-				continue;
+		// Save Changes
+		if ( 'save' == sanitize_key( $_POST['action'] ) ) {
+			$post_vars = array( 'access_key_id', 'secret_access_key', 'credentials_source' );
+			foreach ( $post_vars as $var ) {
+				if ( ! isset( $_POST[ $var ] ) ) { // input var okay
+					continue;
+				}
+
+				$value = sanitize_text_field( $_POST[ $var ] ); // input var okay
+
+				if ( 'secret_access_key' == $var && '-- not shown --' == $value ) {
+					continue;
+				}
+
+				$this->set_setting( $var, $value );
 			}
 
-			$value = sanitize_text_field( $_POST[ $var ] ); // input var okay
-
-			if ( 'secret_access_key' == $var && '-- not shown --' == $value ) {
-				continue;
-			}
-
-			$this->set_setting( $var, $value );
+			$this->save_settings();
 		}
+		// Test Credentials
+		else if ( 'test_credentials' == sanitize_key( $_POST['action'] ) ) {
+			try {
+				$response = $this->get_client()->get( 'iam' )->getUser( );
 
-		$this->save_settings();
+				// Success - Authenticated and received User response; get ARN from response.
+				$auth_user = __( '[UNKNOWN]', 'amazon-web-services' );
+				if ( $response && $response['User'] && $response['User']['Arn'] ) {
+					$auth_user = $response['User']['Arn'];
+				}
+
+				// FIXME - This is not an error; there MUST be a better way to do this...
+				$this->errors->add( 'test_credentials_success', $auth_user );
+			}
+			// Tried to get credentials from environment or instance metadata, but failed...
+			catch ( InstanceProfileCredentialsException $ex ) {
+				$msg = 'Failed to obtain AWS credentials from environment.';
+				$this->errors->add( 'test_credentials_failed', $msg, $ex );
+				return;
+			}
+			catch ( IamException $ex ) {
+				// Authenticated, but not authorized to perform IAM.getUser().
+				if ( 'AccessDenied' == $ex->getExceptionCode() ) {
+					// Luckily, the error message contains the ARN!
+					preg_match( '/^User: (.*) is not authorized to perform.*$/', $ex->getMessage(), $match );
+					$auth_user = __( '[UNKNOWN]', 'amazon-web-services' );
+					if ( 2 <= count( $match ) ) {
+						$auth_user = $match[1];
+					}
+
+					// FIXME - This is not an error; there MUST be a better way to do this...
+					$this->errors->add( 'test_credentials_success', $auth_user );
+				}
+				// All other IamException cases are failures.
+				else {
+					$msg = __( 'Failed to connect to AWS with configured credentials.', 'amazon-web-services' );
+					$this->errors->add( 'test_credentials_failed', $msg, $ex );
+				}
+				return;
+			}
+			// Everything else is a failure.
+			catch ( AwsExceptionInterface $ex ) {
+				$msg = __( 'Failed to connect to AWS with configured credentials.', 'amazon-web-services' );
+				$this->errors->add( 'test_credentials_failed', $msg, $ex );
+				return;
+			}
+		}
 	}
 
 	/**
@@ -187,7 +259,37 @@ class Amazon_Web_Services extends AWS_Plugin_Base {
 	}
 
 	/**
-	 * Check if we are using constants for the AWS access credentials
+	 * Check if settings for the AWS access credentials are defined in the database
+	 *
+	 * @return bool
+	 */
+	function are_db_keys_set() {
+		$key_id = $this->get_db_access_key_id();
+		$secret_key = $this->get_db_secret_access_key();
+
+		return ! empty( $key_id ) && ! empty( $secret_key );
+	}
+
+	/**
+	 * Get the AWS key from the settings
+	 *
+	 * @return string
+	 */
+	function get_db_access_key_id() {
+		return $this->get_setting( 'access_key_id' );
+	}
+
+	/**
+	 * Get the AWS secret from the settings
+	 *
+	 * @return string
+	 */
+	function get_db_secret_access_key() {
+		return $this->get_setting( 'secret_access_key' );
+	}
+
+	/**
+	 * Check if constants for the AWS access credentials are defined
 	 *
 	 * @return bool
 	 */
@@ -205,7 +307,7 @@ class Amazon_Web_Services extends AWS_Plugin_Base {
 			return AWS_ACCESS_KEY_ID;
 		}
 
-		return $this->get_setting( 'access_key_id' );
+		return $this->get_db_access_key_id();
 	}
 
 	/**
@@ -218,7 +320,16 @@ class Amazon_Web_Services extends AWS_Plugin_Base {
 			return AWS_SECRET_ACCESS_KEY;
 		}
 
-		return $this->get_setting( 'secret_access_key' );
+		return $this->get_db_secret_access_key();
+	}
+
+	/**
+	 * Get the source of AWS credentials
+	 *
+	 * @return string
+	 */
+	function get_credentials_source() {
+		return $this->get_setting( 'credentials_source' );
 	}
 
 	/**
@@ -228,15 +339,35 @@ class Amazon_Web_Services extends AWS_Plugin_Base {
 	 * @return Aws|WP_Error
 	 */
 	function get_client() {
-		if ( ! $this->get_access_key_id() || ! $this->get_secret_access_key() ) {
-			return new WP_Error( 'access_keys_missing', sprintf( __( 'You must first <a href="%s">set your AWS access keys</a> to use this addon.', 'amazon-web-services' ), 'admin.php?page=' . $this->plugin_slug ) ); // xss ok
-		}
-
 		if ( is_null( $this->client ) ) {
-			$args = array(
-				'key'       => $this->get_access_key_id(),
-				'secret'    => $this->get_secret_access_key(),
-			);
+
+			$args = array( );
+
+			$credentials_source = $this->get_credentials_source();
+			if ( empty( $credentials_source ) ) {
+				// NOOP - AWS PHP SDK will handle everything for us!
+			}
+			else if ( 'aws-instance-roles' == $credentials_source ) {
+				// FIXME -- There must be a better way to define this...
+				$cache_dir = '/tmp/cache';
+
+				$fs_cache = new FilesystemCache($cache_dir);
+				$cache_adapter = new DoctrineCacheAdapter($fs_cache);
+				$args['credentials.cache'] = $cache_adapter;
+			}
+			else if ( 'wp-config' == $credentials_source ) {
+				$args['key'] = AWS_ACCESS_KEY_ID;
+				$args['secret'] = AWS_SECRET_ACCESS_KEY;
+			}
+			else if ( 'wp-database' == $credentials_source ) {
+				$args['key'] = $this->get_db_access_key_id();
+				$args['secret'] = $this->get_db_secret_access_key();
+			}
+			else {
+				die( sprintf( _( 'Unsupported AWS credentials source: %s',
+								'amazon-web-services' ),
+							$credentials_source ) );
+			}
 
 			$args         = apply_filters( 'aws_get_client_args', $args );
 			$this->client = Aws::factory( $args );
